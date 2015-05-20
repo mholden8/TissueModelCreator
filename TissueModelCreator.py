@@ -54,31 +54,31 @@ class TissueModelCreatorWidget:
   def setup(self):
     # Instantiate and connect widgets ...
 
-    # # Comment these out when not debugging
-    # #
-    # # Reload and Test area
-    # #
-    # reloadCollapsibleButton = ctk.ctkCollapsibleButton()
-    # reloadCollapsibleButton.text = "Reload && Test"
-    # self.layout.addWidget(reloadCollapsibleButton)
-    # reloadFormLayout = qt.QFormLayout(reloadCollapsibleButton)
+    # Comment these out when not debugging
+    #
+    # Reload and Test area
+    #
+    reloadCollapsibleButton = ctk.ctkCollapsibleButton()
+    reloadCollapsibleButton.text = "Reload && Test"
+    self.layout.addWidget(reloadCollapsibleButton)
+    reloadFormLayout = qt.QFormLayout(reloadCollapsibleButton)
 
-    # # reload button
-    # # (use this during development, but remove it when delivering
-    # #  your module to users)
-    # self.reloadButton = qt.QPushButton("Reload")
-    # self.reloadButton.toolTip = "Reload this module."
-    # self.reloadButton.name = "TissueModelCreator Reload"
-    # reloadFormLayout.addWidget(self.reloadButton)
-    # self.reloadButton.connect('clicked()', self.onReload)
+    # reload button
+    # (use this during development, but remove it when delivering
+    #  your module to users)
+    self.reloadButton = qt.QPushButton("Reload")
+    self.reloadButton.toolTip = "Reload this module."
+    self.reloadButton.name = "TissueModelCreator Reload"
+    reloadFormLayout.addWidget(self.reloadButton)
+    self.reloadButton.connect('clicked()', self.onReload)
 
-    # # reload and test button
-    # # (use this during development, but remove it when delivering
-    # #  your module to users)
-    # self.reloadAndTestButton = qt.QPushButton("Reload and Test")
-    # self.reloadAndTestButton.toolTip = "Reload this module and then run the self tests."
-    # reloadFormLayout.addWidget(self.reloadAndTestButton)
-    # self.reloadAndTestButton.connect('clicked()', self.onReloadAndTest)
+    # reload and test button
+    # (use this during development, but remove it when delivering
+    #  your module to users)
+    self.reloadAndTestButton = qt.QPushButton("Reload and Test")
+    self.reloadAndTestButton.toolTip = "Reload this module and then run the self tests."
+    reloadFormLayout.addWidget(self.reloadAndTestButton)
+    self.reloadAndTestButton.connect('clicked()', self.onReloadAndTest)
 
     #
     # Display Area
@@ -122,6 +122,16 @@ class TissueModelCreatorWidget:
     self.flipCheckBox.setToolTip( "Flip the tissue so it is in the other direction." )
     self.flipCheckBox.setText( "Flip" )
     displayFormLayout.addRow( self.flipCheckBox )
+    
+    #
+    # Force plane (ie plane) checkbox
+    #
+    self.planeCheckBox = qt.QCheckBox()
+    self.planeCheckBox.setCheckState( False )
+    self.planeCheckBox.setToolTip( "Force a plane to fit the collected points on the surface." )
+    self.planeCheckBox.setText( "Plane" )
+    displayFormLayout.addRow( self.planeCheckBox )
+    
 
     #
     # Create Button
@@ -152,7 +162,7 @@ class TissueModelCreatorWidget:
 
   def onCreateButtonClicked(self):
     logic = TissueModelCreatorLogic()
-    surfaceClosed = logic.run( self.markupSelector.currentNode(), self.depthSlider.value, self.flipCheckBox.checked )
+    surfaceClosed = logic.run( self.markupSelector.currentNode(), self.depthSlider.value, self.planeCheckBox.checked, self.flipCheckBox.checked )
     
     if ( surfaceClosed == True ):
       self.statusLabel.setText( "Status: Success!" )
@@ -232,7 +242,7 @@ class TissueModelCreatorLogic:
     pass
 
 
-  def run( self, markupNode, depth, flip ):
+  def run( self, markupNode, depth, fitPlane, flip ):
     """
     Run the actual algorithm
     """
@@ -254,7 +264,11 @@ class TissueModelCreatorLogic:
       
     # Create a polydata object from the points
     # The reversiness doesn't matter - we will fix it later if it os wrong
-    surfacePolyData = self.PointsToSurfacePolyData( points, True )
+    if ( fitPlane ):
+      surfacePolyData = self.PointsToPlanePolyData( points, True )
+    else:
+      surfacePolyData = self.PointsToSurfacePolyData( points, True )
+      
     surfaceCleaner = vtk.vtkCleanPolyData()
     surfaceCleaner.SetInputData( surfacePolyData )
     surfaceCleaner.Update()
@@ -309,7 +323,12 @@ class TissueModelCreatorLogic:
     
     deepHullPoints = self.GetBoundaryPoints( deepPolyData )
     
-    jointHullPolyData = self.JoinBoundaryPoints( surfaceHullPoints, deepHullPoints )
+    # Apparently, the joining needs an offset for the plane, but not for the surface reconstruction
+    if ( fitPlane ):
+      jointHullPolyData = self.JoinBoundaryPoints( surfaceHullPoints, deepHullPoints, 1 )
+    else:
+      jointHullPolyData = self.JoinBoundaryPoints( surfaceHullPoints, deepHullPoints, 0 )
+    
     
     # Append all of the polydata together
     tissuePolyDataAppend = vtk.vtkAppendPolyData()
@@ -401,6 +420,50 @@ class TissueModelCreatorLogic:
     transformFilter.Update()
   
     return transformFilter.GetOutput()
+    
+    
+  def PointsToPlanePolyData( self, inPoints, reverse ):
+
+    # Create the oriented bounding box
+    # This gives us one plane on the bounding box, not the plane of best fit
+    corner = [ 0, 0, 0 ]
+    maxVector = [ 0, 0, 0 ]
+    midVector = [ 0, 0, 0 ]
+    minVector = [ 0, 0, 0 ]
+    size = [ 0, 0, 0 ]    
+    obb = vtk.vtkOBBTree()
+    obb.ComputeOBB( inPoints, corner, maxVector, midVector, minVector, size )
+    
+    # Calculate the mean of the points on the plane
+    base = self.CalculateMean( inPoints )
+    relBase = [ 0, 0, 0 ]
+    # Find the projection of the mean point in the minVector direction
+    vtk.vtkMath().Subtract( base, corner, relBase )
+    normal = minVector[:]
+    vtk.vtkMath().Normalize( normal )
+    dot = vtk.vtkMath().Dot( relBase, normal )
+    dot = 0
+    proj = normal[:]
+    vtk.vtkMath().MultiplyScalar( proj, dot )
+    
+    print dot
+    
+    # Find the points on the plane
+    origin = [ 0, 0, 0 ]
+    point1 = [ 0, 0, 0 ]
+    point2 = [ 0, 0, 0 ]
+    vtk.vtkMath().Add( corner, proj, origin )
+    vtk.vtkMath().Add( origin, maxVector, point1 )
+    vtk.vtkMath().Add( origin, midVector, point2 )
+    
+    # Construct the plane
+    plane = vtk.vtkPlaneSource()
+    plane.SetOrigin( origin )
+    plane.SetPoint1( point1 )
+    plane.SetPoint2( point2 )
+    plane.Update()
+    
+    return plane.GetOutput()
     
 
   def CalculateMean( self, inPoints ):
@@ -500,7 +563,7 @@ class TissueModelCreatorLogic:
     return cleaner.GetOutput().GetPoints()
 
   
-  def JoinBoundaryPoints( self, hullPoints1, hullPoints2 ):
+  def JoinBoundaryPoints( self, hullPoints1, hullPoints2, offset ):
 
     if ( hullPoints1.GetNumberOfPoints() != hullPoints2.GetNumberOfPoints() ):
       return
@@ -513,7 +576,7 @@ class TissueModelCreatorLogic:
       currPointsForSurface = vtk.vtkPoints()
     
       point1 = [ 0, 0, 0 ]
-      hullPoints1.GetPoint( i % numPoints, point1 )
+      hullPoints1.GetPoint( ( i - offset )% numPoints, point1 )
       currPointsForSurface.InsertNextPoint( point1[ 0 ], point1[ 1 ], point1[ 2 ] )
     
       point2 = [ 0, 0, 0 ]
@@ -523,7 +586,7 @@ class TissueModelCreatorLogic:
       # Observe that the deep is flipped from the surface
       # Must proceed in opposite orders
       point3 = [ 0, 0, 0 ]
-      hullPoints1.GetPoint( ( i + 1 ) % numPoints, point3 )
+      hullPoints1.GetPoint( ( i + 1 - offset ) % numPoints, point3 )
       currPointsForSurface.InsertNextPoint( point3[ 0 ], point3[ 1 ], point3[ 2 ] )
     
       point4 = [ 0, 0, 0 ]
